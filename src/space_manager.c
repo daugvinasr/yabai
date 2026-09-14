@@ -12,6 +12,22 @@ extern int g_connection;
 
 #define SPACE_GESTURE_TIMEOUT_MS 500.0f
 
+#define kCGSEventTypeField              55
+#define kCGEventGestureHIDType         110
+#define kCGEventGestureSwipeMotion     123
+#define kCGEventGestureSwipeProgress   124
+#define kCGEventGestureSwipeVelocityX  129
+#define kCGEventGesturePhase           132
+
+#define kCGSEventGesture                29
+#define kCGSEventDockControl            30
+#define kIOHIDEventTypeDockSwipe        23
+#define kCGGestureMotionHorizontal       1
+
+#define kCGSGesturePhaseBegan            1
+#define kCGSGesturePhaseChanged          2
+#define kCGSGesturePhaseEnded            4
+
 static struct {
     bool pending;
     uint64_t time;
@@ -947,6 +963,235 @@ enum space_op_error space_manager_move_space_to_display(struct space_manager *sm
     return SPACE_OP_ERROR_SCRIPTING_ADDITION;
 }
 
+// https://github.com/joshuarli/iss
+
+#define kCGEventGestureSwipeMask        115
+#define kCGEventGestureSwipePositionX   125
+#define kCGEventGestureSwipePositionY   126
+#define kCGEventGestureSwipeVelocityY   130
+#define kCGEventGesturePhaseAlias       134
+#define kCGEventGestureZoomDeltaY       138
+#define kCGEventSourceProcessAlias      169
+#define kCGEventRawIOHIDPayload        4205
+
+#define kIOHIDEventTypeVelocity           9
+#define kIOHIDEventTypeFluidTouchGesture 23
+#define kIOHIDGestureFlavorDockPrimary    3
+
+#pragma pack(push, 1)
+struct iohid_event_base
+{
+    uint32_t size;
+    uint32_t type;
+    uint32_t options;
+    uint8_t depth;
+    uint8_t reserved[3];
+};
+
+struct iohid_fluid_touch_gesture
+{
+    struct iohid_event_base base;
+    int32_t position_x;
+    int32_t position_y;
+    int32_t position_z;
+    uint32_t swipe_mask;
+    uint16_t gesture_motion;
+    uint16_t gesture_flavor;
+    int32_t swipe_progress;
+};
+
+struct iohid_velocity
+{
+    struct iohid_event_base base;
+    int32_t velocity_x;
+    int32_t velocity_y;
+    int32_t velocity_z;
+};
+
+struct iohid_queue_element_header
+{
+    uint64_t timestamp;
+    uint64_t sender_id;
+    uint32_t options;
+    uint32_t attribute_length;
+    uint32_t event_count;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(struct iohid_event_base) == 16, "unexpected iohid event base layout");
+static_assert(sizeof(struct iohid_fluid_touch_gesture) == 40, "unexpected iohid fluid gesture layout");
+static_assert(sizeof(struct iohid_velocity) == 28, "unexpected iohid velocity layout");
+static_assert(sizeof(struct iohid_queue_element_header) == 28, "unexpected iohid queue header layout");
+
+static inline int32_t space_gesture_fixed_16_16(double value)
+{
+    int32_t fixed = (int32_t)(value * 65536.0);
+    if (fixed == 0 && value != 0.0) return value > 0.0 ? 1 : -1;
+    return fixed;
+}
+
+static CGEventRef space_gesture_attach_iohid_payload(CGEventRef event)
+{
+    int64_t phase      = CGEventGetIntegerValueField(event, kCGEventGesturePhase);
+    int64_t motion     = CGEventGetIntegerValueField(event, kCGEventGestureSwipeMotion);
+    int64_t swipe_mask = CGEventGetIntegerValueField(event, kCGEventGestureSwipeMask);
+    double progress    = CGEventGetDoubleValueField(event, kCGEventGestureSwipeProgress);
+    double position_x  = CGEventGetDoubleValueField(event, kCGEventGestureSwipePositionX);
+    double position_y  = CGEventGetDoubleValueField(event, kCGEventGestureSwipePositionY);
+    double velocity_x  = CGEventGetDoubleValueField(event, kCGEventGestureSwipeVelocityX);
+    double velocity_y  = CGEventGetDoubleValueField(event, kCGEventGestureSwipeVelocityY);
+
+    bool include_velocity = velocity_x != 0.0 || velocity_y != 0.0 || phase == kCGSGesturePhaseEnded;
+    size_t payload_length = sizeof(struct iohid_queue_element_header) + sizeof(struct iohid_fluid_touch_gesture);
+    if (include_velocity) payload_length += sizeof(struct iohid_velocity);
+
+    uint8_t *payload = ts_alloc_list(uint8_t, payload_length);
+    memset(payload, 0, payload_length);
+
+    struct iohid_queue_element_header *header = (struct iohid_queue_element_header *) payload;
+    uint64_t timestamp = CGEventGetTimestamp(event);
+    header->timestamp = timestamp ? timestamp : mach_absolute_time();
+    header->event_count = include_velocity ? 2 : 1;
+
+    struct iohid_fluid_touch_gesture *fluid = (struct iohid_fluid_touch_gesture *) (payload + sizeof(struct iohid_queue_element_header));
+    fluid->base.size       = sizeof(struct iohid_fluid_touch_gesture);
+    fluid->base.type       = kIOHIDEventTypeFluidTouchGesture;
+    fluid->base.options    = (uint32_t)((phase & 0xFF) << 24);
+    fluid->position_x      = space_gesture_fixed_16_16(position_x);
+    fluid->position_y      = space_gesture_fixed_16_16(position_y);
+    fluid->swipe_mask      = (uint32_t) swipe_mask;
+    fluid->gesture_motion  = (uint16_t) motion;
+    fluid->gesture_flavor  = kIOHIDGestureFlavorDockPrimary;
+    fluid->swipe_progress  = space_gesture_fixed_16_16(progress);
+
+    if (include_velocity) {
+        struct iohid_velocity *velocity = (struct iohid_velocity *) (payload + sizeof(struct iohid_queue_element_header) + sizeof(struct iohid_fluid_touch_gesture));
+        velocity->base.size  = sizeof(struct iohid_velocity);
+        velocity->base.type  = kIOHIDEventTypeVelocity;
+        velocity->base.depth = 1;
+        velocity->velocity_x = space_gesture_fixed_16_16(velocity_x);
+        velocity->velocity_y = space_gesture_fixed_16_16(velocity_y);
+    }
+
+    CFDataRef data = CGEventCreateData(kCFAllocatorDefault, event);
+    if (!data) return NULL;
+
+    const uint8_t *bytes = CFDataGetBytePtr(data);
+    CFIndex length = CFDataGetLength(data);
+
+    if (length < 4 || bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 2) {
+        CFRelease(data);
+        return NULL;
+    }
+
+    size_t new_length = (size_t) length + 4 + payload_length;
+    uint8_t *new_bytes = ts_alloc_list(uint8_t, new_length);
+    memcpy(new_bytes, bytes, length);
+    new_bytes[length + 0] = (uint8_t)(payload_length >> 8);
+    new_bytes[length + 1] = (uint8_t)(payload_length);
+    new_bytes[length + 2] = (uint8_t)(kCGEventRawIOHIDPayload >> 8);
+    new_bytes[length + 3] = (uint8_t)(kCGEventRawIOHIDPayload);
+    memcpy(new_bytes + length + 4, payload, payload_length);
+    CFRelease(data);
+
+    CFDataRef new_data = CFDataCreate(kCFAllocatorDefault, new_bytes, (CFIndex) new_length);
+    if (!new_data) return NULL;
+
+    CGEventRef result = CGEventCreateFromData(kCFAllocatorDefault, new_data);
+    CFRelease(new_data);
+    return result;
+}
+
+static CGEventRef space_gesture_create_dock_swipe_event(int phase, double progress, double velocity)
+{
+    CGEventRef event = CGEventCreate(NULL);
+    if (!event) return NULL;
+
+    CGEventSetIntegerValueField(event, kCGSEventTypeField,           kCGSEventDockControl);
+    CGEventSetIntegerValueField(event, kCGEventGestureHIDType,       kIOHIDEventTypeDockSwipe);
+    CGEventSetIntegerValueField(event, kCGEventGesturePhase,         phase);
+    CGEventSetIntegerValueField(event, kCGEventGesturePhaseAlias,    phase);
+    CGEventSetIntegerValueField(event, kCGEventGestureSwipeMotion,   kCGGestureMotionHorizontal);
+    CGEventSetDoubleValueField(event,  kCGEventGestureSwipeProgress, progress);
+    CGEventSetDoubleValueField(event,  kCGEventGestureSwipePositionX, 0.1);
+    CGEventSetDoubleValueField(event,  kCGEventGestureZoomDeltaY,    3.0);
+    CGEventSetDoubleValueField(event,  kCGEventSourceProcessAlias,   (double) mach_absolute_time());
+    CGEventSetDoubleValueField(event,  kCGEventGestureSwipeVelocityX, velocity);
+
+    CGEventRef result = space_gesture_attach_iohid_payload(event);
+    CFRelease(event);
+    return result;
+}
+
+static bool space_gesture_post_dock_swipe_event(CGEventRef event)
+{
+    if (!event) return false;
+
+    CGEventRef companion = CGEventCreate(NULL);
+    if (!companion) {
+        CFRelease(event);
+        return false;
+    }
+
+    CGEventSetIntegerValueField(companion, kCGSEventTypeField, kCGSEventGesture);
+    CGEventPost(kCGSessionEventTap, event);
+    CGEventPost(kCGSessionEventTap, companion);
+    CFRelease(companion);
+    CFRelease(event);
+    return true;
+}
+
+static bool space_gesture_post_dock_swipe_golden_gate(int count, float sign)
+{
+    double direction = -sign;
+
+    for (int i = 0; i < count; ++i) {
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseBegan,   direction, 0.0)))                return false;
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseChanged, direction, 0.0)))                return false;
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseEnded,   direction, direction * 9999.0))) return false;
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseEnded,   0.0,       0.0)))                return false;
+    }
+
+    return true;
+}
+
+static bool space_gesture_post_dock_swipe(int count, float sign)
+{
+    if (workspace_is_macos_golden_gate()) {
+        return space_gesture_post_dock_swipe_golden_gate(count, sign);
+    }
+
+    //
+    // NOTE(asmvik): MacOS does not have an API that allows for space activation.
+    // However, we can synthesize a sequence of high velocity gestures to skip the
+    // animation instead.
+    //
+    // :Attribution
+    // https://github.com/jurplel/InstantSpaceSwitcher
+    // https://github.com/thenickdude/wacom-driver-fix/blob/bdfda9a788934c88d09d31ea6a42664b9ba1471e/Readme.md
+    // Technique first observed in practice, and reverse-engineered from, BetterTouchTool.
+    //
+
+    CGEventRef event_dock_control = CGEventCreate(NULL);
+    if (!event_dock_control) return false;
+
+    CGEventSetIntegerValueField(event_dock_control, kCGSEventTypeField,            kCGSEventDockControl);
+    CGEventSetIntegerValueField(event_dock_control, kCGEventGestureHIDType,        kIOHIDEventTypeDockSwipe);
+    CGEventSetIntegerValueField(event_dock_control, kCGEventGestureSwipeMotion,    kCGGestureMotionHorizontal);
+    CGEventSetDoubleValueField(event_dock_control,  kCGEventGestureSwipeProgress,  sign);
+    CGEventSetDoubleValueField(event_dock_control,  kCGEventGestureSwipeVelocityX, sign * 9999.0);
+
+    for (int i = 0; i < count; ++i) {
+        CGEventSetIntegerValueField(event_dock_control, kCGEventGesturePhase, kCGSGesturePhaseBegan);
+        CGEventPost(kCGSessionEventTap, event_dock_control);
+        CGEventSetIntegerValueField(event_dock_control, kCGEventGesturePhase, kCGSGesturePhaseEnded);
+        CGEventPost(kCGSessionEventTap, event_dock_control);
+    }
+    CFRelease(event_dock_control);
+
+    return true;
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
@@ -979,27 +1224,6 @@ bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
     bool focus_display = cur_did != new_did;
     if (focus_display) CGWarpMouseCursorPosition(point);
 
-    //
-    // NOTE(asmvik): MacOS does not have an API that allows for space activation.
-    // However, we can synthesize a sequence of high velocity gestures to skip the
-    // animation instead.
-    //
-    // :Attribution
-    // https://github.com/jurplel/InstantSpaceSwitcher
-    // https://github.com/thenickdude/wacom-driver-fix/blob/bdfda9a788934c88d09d31ea6a42664b9ba1471e/Readme.md
-    // Technique first observed in practice, and reverse-engineered from, BetterTouchTool.
-    //
-
-    CGEventRef event_dock_control = CGEventCreate(NULL);
-    if (!event_dock_control) return false;
-
-    float sign = (new_index - cur_index) > 0 ? 1.0 : -1.0;
-    CGEventSetIntegerValueField(event_dock_control, /* kCGSEventTypeField            */  55, /* kCGSEventDockControl       */ 30);
-    CGEventSetIntegerValueField(event_dock_control, /* kCGEventGestureHIDType        */ 110, /* kIOHIDEventTypeDockSwipe   */ 23);
-    CGEventSetIntegerValueField(event_dock_control, /* kCGEventGestureSwipeMotion    */ 123, /* kCGGestureMotionHorizontal */  1);
-    CGEventSetDoubleValueField(event_dock_control,  /* kCGEventGestureSwipeProgress  */ 124, sign);
-    CGEventSetDoubleValueField(event_dock_control,  /* kCGEventGestureSwipeVelocityX */ 129, sign * 9999.0);
-
     __space_gesture.pending = true;
     __space_gesture.time = read_os_timer();
     __space_gesture.sid = new_sid;
@@ -1007,13 +1231,11 @@ bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
     __space_gesture.next_did = 0;
     uint32_t generation = ++__space_gesture.generation;
 
-    for (int i = 0; i < count; ++i) {
-        CGEventSetIntegerValueField(event_dock_control, /* kCGEventGesturePhase */ 132, /* kCGSGesturePhaseBegan */ 1);
-        CGEventPost(kCGSessionEventTap, event_dock_control);
-        CGEventSetIntegerValueField(event_dock_control, /* kCGEventGesturePhase */ 132, /* kCGSGesturePhaseEnded */ 4);
-        CGEventPost(kCGSessionEventTap, event_dock_control);
+    float sign = (new_index - cur_index) > 0 ? 1.0f : -1.0f;
+    if (!space_gesture_post_dock_swipe(count, sign)) {
+        __space_gesture.pending = false;
+        return false;
     }
-    CFRelease(event_dock_control);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (SPACE_GESTURE_TIMEOUT_MS / 1000.0f) * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         event_loop_post(&g_event_loop, SPACE_GESTURE_TIMEOUT, NULL, generation);
