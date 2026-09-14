@@ -91,6 +91,8 @@ bool space_manager_mirror_space(struct space_manager *sm, uint64_t sid, enum win
 void space_manager_move_window_list_to_space(uint64_t sid, uint32_t *window_list, int window_count);
 void space_manager_move_window_to_space(uint64_t sid, struct window *window);
 bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid);
+void space_manager_gesture_did_change_space(void);
+void space_manager_gesture_did_timeout(uint32_t generation);
 enum space_op_error space_manager_focus_space(uint64_t sid);
 enum space_op_error space_manager_switch_space(uint64_t sid);
 enum space_op_error space_manager_swap_space_with_space(uint64_t acting_sid, uint64_t selector_sid);

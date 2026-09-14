@@ -1026,6 +1026,13 @@ static EVENT_HANDLER(SPACE_CHANGED)
     }
 
     event_signal_push(SIGNAL_SPACE_CHANGED, NULL);
+
+    space_manager_gesture_did_change_space();
+}
+
+static EVENT_HANDLER(SPACE_GESTURE_TIMEOUT)
+{
+    space_manager_gesture_did_timeout((uint32_t) param1);
 }
 
 static EVENT_HANDLER(DISPLAY_CHANGED)
