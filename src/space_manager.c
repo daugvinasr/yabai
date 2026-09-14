@@ -1,5 +1,30 @@
 extern struct window_manager g_window_manager;
+extern struct event_loop g_event_loop;
 extern int g_connection;
+
+// Synthetic dock-swipe gestures must not overlap. Injecting a
+// new gesture while the WindowServer is still compositing the previous space
+// transition can leave the display blank for several seconds.
+// https://github.com/jurplel/InstantSpaceSwitcher/issues/53
+// https://github.com/jurplel/InstantSpaceSwitcher/issues/58
+// https://github.com/jurplel/InstantSpaceSwitcher/pull/87
+
+
+#define SPACE_GESTURE_TIMEOUT_MS 500.0f
+
+static struct {
+    bool pending;
+    uint64_t time;
+    uint64_t sid;
+    uint32_t generation;
+    uint64_t next_sid;
+    uint32_t next_did;
+} __space_gesture;
+
+static inline float space_gesture_elapsed_ms(void)
+{
+    return ((float) read_os_timer() - __space_gesture.time) * (1000.0f / (float)read_os_freq());
+}
 
 static TABLE_HASH_FUNC(hash_view)
 {
@@ -926,6 +951,19 @@ enum space_op_error space_manager_move_space_to_display(struct space_manager *sm
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
 {
+    if (__space_gesture.pending) {
+        float dt = space_gesture_elapsed_ms();
+        if (dt < SPACE_GESTURE_TIMEOUT_MS) {
+            debug("%s: transition to %lld in flight (%.2fms), coalescing target %lld\n", __FUNCTION__, __space_gesture.sid, dt, new_sid);
+            __space_gesture.next_did = new_did;
+            __space_gesture.next_sid = new_sid;
+            return true;
+        }
+
+        debug("%s: transition to %lld timed out after %.2fms, recovering..\n", __FUNCTION__, __space_gesture.sid, dt);
+        __space_gesture.pending = false;
+    }
+
     int cur_index = space_manager_mission_control_index(display_space_id(new_did));
     int new_index = space_manager_mission_control_index(new_sid);
 
@@ -962,6 +1000,13 @@ bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
     CGEventSetDoubleValueField(event_dock_control,  /* kCGEventGestureSwipeProgress  */ 124, sign);
     CGEventSetDoubleValueField(event_dock_control,  /* kCGEventGestureSwipeVelocityX */ 129, sign * 9999.0);
 
+    __space_gesture.pending = true;
+    __space_gesture.time = read_os_timer();
+    __space_gesture.sid = new_sid;
+    __space_gesture.next_sid = 0;
+    __space_gesture.next_did = 0;
+    uint32_t generation = ++__space_gesture.generation;
+
     for (int i = 0; i < count; ++i) {
         CGEventSetIntegerValueField(event_dock_control, /* kCGEventGesturePhase */ 132, /* kCGSGesturePhaseBegan */ 1);
         CGEventPost(kCGSessionEventTap, event_dock_control);
@@ -969,6 +1014,10 @@ bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
         CGEventPost(kCGSessionEventTap, event_dock_control);
     }
     CFRelease(event_dock_control);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (SPACE_GESTURE_TIMEOUT_MS / 1000.0f) * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        event_loop_post(&g_event_loop, SPACE_GESTURE_TIMEOUT, NULL, generation);
+    });
 
     if (focus_display) {
         display_manager_set_active_display_id(new_did);
@@ -981,6 +1030,44 @@ bool space_manager_focus_space_using_gesture(uint32_t new_did, uint64_t new_sid)
     return true;
 }
 #pragma clang diagnostic pop
+
+static void space_manager_flush_coalesced_gesture(void)
+{
+    __space_gesture.pending = false;
+
+    uint64_t sid = __space_gesture.next_sid;
+    uint32_t did = __space_gesture.next_did;
+    __space_gesture.next_sid = 0;
+    __space_gesture.next_did = 0;
+
+    if (!sid) return;
+    if (mission_control_is_active()) return;
+    if (space_manager_active_space() == sid) return;
+
+    debug("%s: flushing coalesced target %lld\n", __FUNCTION__, sid);
+    space_manager_focus_space_using_gesture(did, sid);
+}
+
+void space_manager_gesture_did_change_space(void)
+{
+    if (!__space_gesture.pending) return;
+
+    if (space_manager_active_space() != __space_gesture.sid && space_gesture_elapsed_ms() < SPACE_GESTURE_TIMEOUT_MS) {
+        debug("%s: intermediate space, still waiting for %lld\n", __FUNCTION__, __space_gesture.sid);
+        return;
+    }
+
+    space_manager_flush_coalesced_gesture();
+}
+
+void space_manager_gesture_did_timeout(uint32_t generation)
+{
+    if (!__space_gesture.pending) return;
+    if (__space_gesture.generation != generation) return;
+
+    debug("%s: no SPACE_CHANGED for %lld after %.2fms, recovering..\n", __FUNCTION__, __space_gesture.sid, space_gesture_elapsed_ms());
+    space_manager_flush_coalesced_gesture();
+}
 
 enum space_op_error space_manager_focus_space(uint64_t sid)
 {
