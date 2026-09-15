@@ -19,7 +19,6 @@ extern int g_connection;
 #define kCGEventGestureSwipeVelocityX  129
 #define kCGEventGesturePhase           132
 
-#define kCGSEventGesture                29
 #define kCGSEventDockControl            30
 #define kIOHIDEventTypeDockSwipe        23
 #define kCGGestureMotionHorizontal       1
@@ -1107,16 +1106,24 @@ static CGEventRef space_gesture_create_dock_swipe_event(int phase, double progre
     CGEventRef event = CGEventCreate(NULL);
     if (!event) return NULL;
 
-    CGEventSetIntegerValueField(event, kCGSEventTypeField,           kCGSEventDockControl);
-    CGEventSetIntegerValueField(event, kCGEventGestureHIDType,       kIOHIDEventTypeDockSwipe);
-    CGEventSetIntegerValueField(event, kCGEventGesturePhase,         phase);
-    CGEventSetIntegerValueField(event, kCGEventGesturePhaseAlias,    phase);
-    CGEventSetIntegerValueField(event, kCGEventGestureSwipeMotion,   kCGGestureMotionHorizontal);
-    CGEventSetDoubleValueField(event,  kCGEventGestureSwipeProgress, progress);
+    CGEventSetIntegerValueField(event, kCGSEventTypeField,            kCGSEventDockControl);
+    CGEventSetIntegerValueField(event, kCGEventGestureHIDType,        kIOHIDEventTypeDockSwipe);
+    CGEventSetIntegerValueField(event, kCGEventGesturePhase,          phase);
+    CGEventSetIntegerValueField(event, kCGEventGesturePhaseAlias,     phase);
+    CGEventSetIntegerValueField(event, kCGEventGestureSwipeMotion,    kCGGestureMotionHorizontal);
+    CGEventSetDoubleValueField(event,  kCGEventGestureSwipeProgress,  progress);
     CGEventSetDoubleValueField(event,  kCGEventGestureSwipePositionX, 0.1);
-    CGEventSetDoubleValueField(event,  kCGEventGestureZoomDeltaY,    3.0);
-    CGEventSetDoubleValueField(event,  kCGEventSourceProcessAlias,   (double) mach_absolute_time());
-    CGEventSetDoubleValueField(event,  kCGEventGestureSwipeVelocityX, velocity);
+    CGEventSetDoubleValueField(event,  kCGEventGestureZoomDeltaY,     3.0);
+    CGEventSetDoubleValueField(event,  kCGEventSourceProcessAlias,    (double) mach_absolute_time());
+
+    //
+    // NOTE: Only the Ended event carries velocity. Velocity on Began/Changed
+    // can cause the switch to bounce.
+    //
+
+    if (phase == kCGSGesturePhaseEnded) {
+        CGEventSetDoubleValueField(event, kCGEventGestureSwipeVelocityX, velocity);
+    }
 
     CGEventRef result = space_gesture_attach_iohid_payload(event);
     CFRelease(event);
@@ -1127,29 +1134,28 @@ static bool space_gesture_post_dock_swipe_event(CGEventRef event)
 {
     if (!event) return false;
 
-    CGEventRef companion = CGEventCreate(NULL);
-    if (!companion) {
-        CFRelease(event);
-        return false;
-    }
-
-    CGEventSetIntegerValueField(companion, kCGSEventTypeField, kCGSEventGesture);
     CGEventPost(kCGSessionEventTap, event);
-    CGEventPost(kCGSessionEventTap, companion);
-    CFRelease(companion);
     CFRelease(event);
     return true;
 }
 
 static bool space_gesture_post_dock_swipe_golden_gate(int count, float sign)
 {
-    double direction = -sign;
+    //
+    // NOTE: On macOS 27 the Dock server validates the public progress value as
+    // well as the raw IOHID payload. Use the smallest non-zero value that
+    // survives 16.16 fixed-point quantization so the switch is instant.
+    // The Dock server also interprets the sign of progress and velocity
+    // inverted relative to the legacy path, so flip both.
+    //
+
+    double progress = -sign * 0.000016;
+    double velocity = -sign * 2000.0;
 
     for (int i = 0; i < count; ++i) {
-        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseBegan,   direction, 0.0)))                return false;
-        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseChanged, direction, 0.0)))                return false;
-        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseEnded,   direction, direction * 9999.0))) return false;
-        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseEnded,   0.0,       0.0)))                return false;
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseBegan,   progress, velocity))) return false;
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseChanged, progress, velocity))) return false;
+        if (!space_gesture_post_dock_swipe_event(space_gesture_create_dock_swipe_event(kCGSGesturePhaseEnded,   progress, velocity))) return false;
     }
 
     return true;
