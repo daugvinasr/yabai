@@ -9,6 +9,13 @@ extern int g_connection;
 extern void *g_workspace_context;
 extern int g_layer_below_window_level;
 volatile bool __pending_window_focus;
+
+struct focus_recovery
+{
+    uint32_t destroyed_wid;
+    uint32_t sibling_wid;
+    uint64_t sid;
+};
 volatile bool __pending_gesture;
 volatile uint64_t __last_gesture_time;
 volatile uint64_t __last_cmd_tab_time;
@@ -611,6 +618,36 @@ static EVENT_HANDLER(WINDOW_DESTROYED)
     debug("%s: %s %d\n", __FUNCTION__, window->application ? window->application->name : "<unknown>", window->id);
 
     struct view *view = window_manager_find_managed_window(&g_window_manager, window);
+
+    //
+    // NOTE(daugvinas): When the focused window is closed and its application has no
+    // other window, macOS (observed on macOS 27) either keeps that application frontmost
+    // without a key window, or, if the application quits, activates Finder without a
+    // window. In both cases no window ever receives focus. Remember the state we need
+    // and schedule a check that focuses a replacement window if focus has not moved on
+    // its own by then. If the application has other windows, AppKit hands focus over
+    // before the destroy notification and the check is a no-op.
+    //
+
+    struct focus_recovery *focus_recovery = NULL;
+    bool was_focused = g_window_manager.focused_window_id == window->id ||
+                      (g_window_manager.focused_window_id == 0 && g_window_manager.last_window_id == window->id);
+    if (was_focused) {
+        focus_recovery = malloc(sizeof(struct focus_recovery));
+        focus_recovery->destroyed_wid = window->id;
+        focus_recovery->sid = view ? view->sid : g_space_manager.current_space_id;
+        focus_recovery->sibling_wid = 0;
+
+        if (view) {
+            struct window_node *node = view_find_window_node(view, window->id);
+            if (node && node->parent) {
+                struct window_node *sibling = node->parent->left == node ? node->parent->right : node->parent->left;
+                struct window_node *leaf = view_find_min_depth_leaf_node(sibling);
+                if (leaf) focus_recovery->sibling_wid = leaf->window_order[0];
+            }
+        }
+    }
+
     if (view) {
         space_manager_untile_window(view, window);
         window_manager_remove_managed_window(&g_window_manager, window->id);
@@ -623,6 +660,12 @@ static EVENT_HANDLER(WINDOW_DESTROYED)
         event_signal_push(SIGNAL_WINDOW_DESTROYED, window);
     }
 
+    if (focus_recovery) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.15f * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            event_loop_post(&g_event_loop, WINDOW_FOCUS_RECOVERY, focus_recovery, 0);
+        });
+    }
+
     window_manager_remove_scratchpad_for_window(&g_window_manager, window, false);
     window_manager_remove_window(&g_window_manager, window->id);
     window_unobserve(window);
@@ -631,6 +674,60 @@ static EVENT_HANDLER(WINDOW_DESTROYED)
     if (workspace_is_macos_sequoia() || workspace_is_macos_tahoe() || workspace_is_macos_golden_gate()) {
         update_window_notifications();
     }
+}
+
+static struct window *focus_recovery_candidate(uint32_t wid, uint64_t sid)
+{
+    struct window *window = window_manager_find_window(&g_window_manager, wid);
+    if (!window)                                     return NULL;
+    if (!window_manager_is_window_eligible(window))  return NULL;
+    if (window_check_flag(window, WINDOW_MINIMIZE))  return NULL;
+    if (window_space(window->id) != sid)             return NULL;
+    return window;
+}
+
+static EVENT_HANDLER(WINDOW_FOCUS_RECOVERY)
+{
+    struct focus_recovery *recovery = context;
+    uint32_t destroyed_wid = recovery->destroyed_wid;
+    uint32_t sibling_wid   = recovery->sibling_wid;
+    uint64_t sid           = recovery->sid;
+    free(recovery);
+
+    //
+    // NOTE(daugvinas): Focus moved to a real window in the meantime; nothing to do.
+    // A focused_window_id of zero means a window-less application (usually Finder)
+    // was made frontmost as a side-effect of the destroyed window's application quitting.
+    //
+
+    if (g_window_manager.focused_window_id != destroyed_wid && g_window_manager.focused_window_id != 0) return;
+    if (sid != g_space_manager.current_space_id) return;
+    if (mission_control_is_active())             return;
+
+    struct window *focused_window = window_manager_focused_window(&g_window_manager);
+    if (focused_window && !window_check_flag(focused_window, WINDOW_MINIMIZE)) {
+        debug("%s: %s %d is focused but the event was never delivered, replaying..\n", __FUNCTION__, focused_window->application->name, focused_window->id);
+        event_loop_post(&g_event_loop, WINDOW_FOCUSED, (void *)(intptr_t) focused_window->id, 0);
+        return;
+    }
+
+    struct window *window = NULL;
+    bool below_cursor = false;
+
+    if (g_window_manager.ffm_mode != FFM_DISABLED) {
+        struct window *candidate = window_manager_find_window_below_cursor(&g_window_manager);
+        if (candidate) window = focus_recovery_candidate(candidate->id, sid);
+        below_cursor = window != NULL;
+    }
+
+    if (!window) window = focus_recovery_candidate(sibling_wid, sid);
+    if (!window) window = focus_recovery_candidate(g_window_manager.last_window_id, sid);
+    if (!window) window = window_manager_find_largest_managed_window(&g_space_manager, &g_window_manager);
+    if (!window) return;
+
+    debug("%s: %d was destroyed without a focus hand-off, focusing %s %d\n", __FUNCTION__, destroyed_wid, window->application->name, window->id);
+    window_manager_focus_window_with_raise(&window->application->psn, window->id, window->ref);
+    if (below_cursor) g_mouse_state.ffm_window_id = window->id;
 }
 
 static EVENT_HANDLER(WINDOW_FOCUSED)
