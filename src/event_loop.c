@@ -1619,6 +1619,11 @@ static EVENT_HANDLER(SYSTEM_WOKE)
     event_signal_push(SIGNAL_SYSTEM_WOKE, NULL);
 }
 
+static EVENT_HANDLER(STATUS_INDICATOR_REFRESH)
+{
+    status_indicator_refresh();
+}
+
 static EVENT_HANDLER(DAEMON_MESSAGE)
 {
     TIME_FUNCTION;
@@ -1669,13 +1674,15 @@ static void *event_loop_run(void *context)
                 if (!next) goto empty;
             } while (!__sync_bool_compare_and_swap(&event_loop->head, head, next));
 
-            switch (__atomic_load_n(&next->type, __ATOMIC_RELAXED)) {
+            enum event_type type = __atomic_load_n(&next->type, __ATOMIC_RELAXED);
+            switch (type) {
 #define EVENT_TYPE_ENTRY(value) case value: EVENT_HANDLER_##value(__atomic_load_n(&next->context, __ATOMIC_RELAXED), __atomic_load_n(&next->param1, __ATOMIC_RELAXED)); break;
                 EVENT_TYPE_LIST
 #undef EVENT_TYPE_ENTRY
             }
 
             event_signal_flush();
+            status_indicator_notify_event(type);
             ts_reset();
 
             profile_end_and_print();
