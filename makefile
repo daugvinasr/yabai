@@ -12,6 +12,7 @@ OSAX_SRC       = ./src/osax/payload_bin.c ./src/osax/loader_bin.c
 YABAI_SRC      = ./src/manifest.m $(OSAX_SRC)
 OSAX_PATH      = ./src/osax
 INFO_PLIST     = $(ASSET_PATH)/Info.plist
+COMMIT         = $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BINS           = $(BUILD_PATH)/yabai
 
 .PHONY: all asan tsan install man icon archive publish sign clean-build clean
@@ -65,4 +66,4 @@ clean: clean-build
 
 $(BUILD_PATH)/yabai: $(YABAI_SRC)
 	mkdir -p $(BUILD_PATH)
-	xcrun clang $^ $(BUILD_FLAGS) $(CLI_FLAGS) $(FRAMEWORK_PATH) $(FRAMEWORK) -o $@
+	xcrun clang $^ $(BUILD_FLAGS) $(CLI_FLAGS) -DYABAI_COMMIT=\"$(COMMIT)\" $(FRAMEWORK_PATH) $(FRAMEWORK) -o $@

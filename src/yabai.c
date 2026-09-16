@@ -24,6 +24,10 @@
 #define MINOR  1
 #define PATCH 25
 
+#ifndef YABAI_COMMIT
+#define YABAI_COMMIT "unknown"
+#endif
+
 struct signal *g_signal_event[SIGNAL_TYPE_COUNT];
 struct process_manager g_process_manager;
 struct display_manager g_display_manager;
@@ -45,6 +49,7 @@ char g_sa_socket_file[MAXLEN];
 char g_socket_file[MAXLEN];
 char g_config_file[4096];
 char g_lock_file[MAXLEN];
+char g_version_string[MAXLEN];
 
 mach_port_t g_bs_port;
 int g_connection;
@@ -135,6 +140,7 @@ static inline bool configure_settings_and_acquire_lock(void)
     snprintf(g_sa_socket_file, sizeof(g_sa_socket_file), SA_SOCKET_PATH_FMT, user);
     snprintf(g_socket_file, sizeof(g_socket_file), SOCKET_PATH_FMT, user);
     snprintf(g_lock_file, sizeof(g_lock_file), LCFILE_PATH_FMT, user);
+    snprintf(g_version_string, sizeof(g_version_string), "yabai-v%d.%d.%d (%s)", MAJOR, MINOR, PATCH, YABAI_COMMIT);
 
     NSApplicationLoad();
     g_pid = getpid();
@@ -346,6 +352,8 @@ int main(int argc, char **argv)
     if (!message_loop_begin(g_socket_file)) {
         error("yabai: could not start message loop! abort..\n");
     }
+
+    status_indicator_begin();
 
     exec_config_file(g_config_file, sizeof(g_config_file));
 
