@@ -271,13 +271,20 @@ void mouse_state_init(struct mouse_state *state)
     state->drop_action = MOUSE_MODE_SWAP;
 }
 
-static void *mouse_handler_thread(void *context)
+struct mouse_handler_thread_context
 {
-    struct mouse_state *mouse_state = context;
+    struct mouse_state *mouse_state;
+    dispatch_semaphore_t ready;
+};
+
+static void *mouse_handler_thread(void *data)
+{
+    struct mouse_handler_thread_context *context = data;
+    struct mouse_state *mouse_state = context->mouse_state;
 
     mouse_state->runloop = CFRunLoopGetCurrent();
     CFRunLoopAddSource(mouse_state->runloop, mouse_state->runloop_source, kCFRunLoopCommonModes);
-    dispatch_semaphore_signal(mouse_state->ready);
+    dispatch_semaphore_signal(context->ready);
     CFRunLoopRun();
 
     return NULL;
@@ -297,10 +304,19 @@ bool mouse_handler_begin(struct mouse_state *mouse_state, uint32_t mask)
     }
 
     mouse_state->runloop_source = CFMachPortCreateRunLoopSource(NULL, mouse_state->handle, 0);
-    mouse_state->ready = dispatch_semaphore_create(0);
-    pthread_create(&mouse_state->thread, NULL, &mouse_handler_thread, mouse_state);
-    dispatch_semaphore_wait(mouse_state->ready, DISPATCH_TIME_FOREVER);
-    dispatch_release(mouse_state->ready);
+
+    struct mouse_handler_thread_context context = { mouse_state, dispatch_semaphore_create(0) };
+    if (pthread_create(&mouse_state->thread, NULL, &mouse_handler_thread, &context) != 0) {
+        dispatch_release(context.ready);
+        CFRelease(mouse_state->runloop_source);
+        CFMachPortInvalidate(mouse_state->handle);
+        CFRelease(mouse_state->handle);
+        mouse_state->handle = NULL;
+        return false;
+    }
+
+    dispatch_semaphore_wait(context.ready, DISPATCH_TIME_FOREVER);
+    dispatch_release(context.ready);
 
     return true;
 }
