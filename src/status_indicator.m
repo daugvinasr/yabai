@@ -147,8 +147,8 @@ static NSImage *status_indicator_image(struct status_indicator_cell *cells, int 
         struct status_indicator_cell *cell = &cells[i];
         NSRect box = NSMakeRect(x, 0, item_size, item_size);
 
-        // Three tiers: on screen, off screen with windows, off screen and empty.
-        CGFloat alpha = cell->visible ? 1.0 : cell->occupied ? 0.5 : 0.25;
+        // Two tiers: on screen or holding windows, versus off screen and empty.
+        CGFloat alpha = cell->visible || cell->occupied ? 1.0 : 0.25;
 
         if (cell->fullscreen) {
             // Stroke straddles the path, so pull it half a linewidth inward to
